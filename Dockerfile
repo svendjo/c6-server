@@ -16,7 +16,7 @@ RUN python3 -m venv venv
 COPY requirements.txt requirements.txt
 RUN venv/bin/pip3 install -r requirements.txt
 
-COPY model0802.h5 prediction.jpg server.py .
+COPY model0802.h5 classification-model0105.keras server.py .
 
 #CMD [ "python3", "-m" , "flask", "run", "--host=0.0.0.0"]
 CMD [ "venv/bin/python3", "server.py" ]
