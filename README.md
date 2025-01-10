@@ -36,6 +36,9 @@ Test the Docker container.
 
 `docker push 021891586863.dkr.ecr.us-west-2.amazonaws.com/chocolate-repository:latest`
 
+## Deploy AWS App Runner
+Go to AWS App Runner and deploy chocolate-repository:latest.
+
 ## Build frontend
 `npm run build`
 
