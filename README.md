@@ -38,9 +38,5 @@ Test the Docker container.
 
 ## Deploy AWS App Runner
 Go to AWS App Runner and deploy chocolate-repository:latest.
+Now go build & deploy the frontend.
 
-## Build frontend
-`npm run build`
-
-## Sync frontend to S3
-`aws s3 sync ./build s3://chocolate-frontend`
