@@ -13,7 +13,7 @@ Activate the environment
 Install requirements.
 
 `pip install setuptools`
-`pip install -r requirements.txt`
+`pip install -r requirements-dev.txt`
 
 Build a Docker image.
 
@@ -27,7 +27,7 @@ Test the Docker container.
 
 `curl -X POST http://localhost:8080/predict \
   -H "Content-Type: multipart/form-data" \
-  -F "file=@workspace/c6-models/prediction.jpg"`
+  -F "file=@/Users/svend/workspace/c6-models/prediction.jpg"`
 
 ## Tag and push it to AWS ECR
 `aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 021891586863.dkr.ecr.us-west-2.amazonaws.com`

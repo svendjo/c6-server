@@ -2,5 +2,5 @@ fastapi==0.115.6
 numpy==1.26.4
 pillow==11.1.0
 python-multipart==0.0.20
-tflite-runtime==2.14.0
+tensorflow==2.16.2
 uvicorn==0.34.0
