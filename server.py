@@ -20,16 +20,17 @@ app.add_middleware(
 )
 
 # Load the counting model
-model_interpreter = tflite(model_path='counting-model0926.tflite')
-model_interpreter.allocate_tensors()
-model_input_details = model_interpreter.get_input_details()
-model_output_details = model_interpreter.get_output_details()
+counting_model_interpreter = tflite(model_path='counting-model0926.tflite')
+counting_model_interpreter.allocate_tensors()
+model_input_details = counting_model_interpreter.get_input_details()
+model_output_details = counting_model_interpreter.get_output_details()
 
 # Load the classification model
-classification_interpreter = tflite(model_path='classification-model0927.tflite')
-classification_interpreter.allocate_tensors()
-classification_input_details = classification_interpreter.get_input_details()
-classification_output_details = classification_interpreter.get_output_details()
+classification_mocel_interpreter = tflite(model_path='classification-model0927.tflite')
+classification_mocel_interpreter.allocate_tensors()
+classification_input_details = classification_mocel_interpreter.get_input_details()
+classification_output_details = classification_mocel_interpreter.get_output_details()
+
 
 def preprocess_image(image, target_size=(300, 300)):
     image = image.resize(target_size)  # Resize the image to match your model's input size
@@ -38,6 +39,11 @@ def preprocess_image(image, target_size=(300, 300)):
     print(image.shape)
 
     return image
+
+
+CLASS_LABEL_BY_ID = {0: "Not Cookie", 1: "Cookie"}
+CONFIDENCE_THRESHOLD = 0.8
+
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
@@ -48,32 +54,28 @@ async def predict(file: UploadFile = File(...)):
         processed_image300 = preprocess_image(image)
 
         # Run inference on the counting model
-        model_interpreter.set_tensor(model_input_details[0]['index'], processed_image300)
-        model_interpreter.invoke()
-        prediction = model_interpreter.get_tensor(model_output_details[0]['index'])
+        counting_model_interpreter.set_tensor(model_input_details[0]['index'], processed_image300)
+        counting_model_interpreter.invoke()
+        chocolate_chips = counting_model_interpreter.get_tensor(model_output_details[0]['index'])
+        print(f"chips: {chocolate_chips}")
 
         # Run inference on the classification model
         processed_image224 = preprocess_image(image, target_size=(224, 224))
-        classification_interpreter.set_tensor(classification_input_details[0]['index'], processed_image224)
-        classification_interpreter.invoke()
-        predictions = classification_interpreter.get_tensor(classification_output_details[0]['index'])[0]
-        print(f"predictions: {predictions}")
-        max_confidence = np.max(predictions)
-        predicted_class = np.argmax(predictions)
-        print(f"predicted_class: {predicted_class}")  # THIS DOESN"T WSORK
+        classification_mocel_interpreter.set_tensor(classification_input_details[0]['index'], processed_image224)
+        classification_mocel_interpreter.invoke()
+        probabilities = classification_mocel_interpreter.get_tensor(classification_output_details[0]['index'])[0]
+        print(f"probabilities [{CLASS_LABEL_BY_ID.values()}]: {probabilities}")
+        max_confidence = np.max(probabilities)
+        class_id = np.argmax(probabilities)
+        print(f"classification: {CLASS_LABEL_BY_ID[class_id]}")
 
         # Determine prediction based on confidence threshold
-        confidence_threshold = 0.8
-
-        if max_confidence >= confidence_threshold:
-            if predicted_class == 1:
-                prediction_text = "Cookie"
-            else:
-                prediction_text = "Not Cookie"
+        if max_confidence >= CONFIDENCE_THRESHOLD:
+            prediction_text = CLASS_LABEL_BY_ID[class_id]
         else:
             prediction_text = "Uncertain"
 
-        return {"prediction": prediction.tolist(), "prediction_text": prediction_text}
+        return {"prediction": chocolate_chips.tolist(), "prediction_text": prediction_text}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
