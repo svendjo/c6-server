@@ -1,0 +1,12 @@
+# Local development environment. Selected by APP_ENV=local-dev (the default),
+# so `python server.py` runs with these settings.
+reload: true                # uvicorn auto-restart on .py changes (needs `watchfiles`)
+confidence_threshold: 0.8   # below this the classifier answers "Uncertain"
+
+models:
+  counting: counting-model0926.tflite             # 300x300 -> chocolate chip count
+  classification: classification-model0927.tflite  # 224x224 -> cookie / not cookie
+
+results:
+  backend: local            # results/<id>/ on local disk
+  dir: results

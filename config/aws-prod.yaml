@@ -1,0 +1,18 @@
+# AWS production environment. Selected by APP_ENV=aws-prod (set in the Dockerfile),
+# so the container's `python server.py` runs with these settings.
+reload: false
+confidence_threshold: 0.8   # below this the classifier answers "Uncertain"
+
+models:
+  counting: counting-model0926.tflite             # 300x300 -> chocolate chip count
+  classification: classification-model0927.tflite  # 224x224 -> cookie / not cookie
+
+results:
+  # s3://chocolate-results/<id>/ -- App Runner's local disk is wiped on every
+  # restart and not shared across instances, so saved predictions must live in
+  # object storage to survive. NOTE: the bucket and the instance role that grants
+  # access to it are NOT provisioned yet -- see DEPLOY.md part A6. Until they are,
+  # prod predictions still work; they just log a warning instead of being saved.
+  backend: s3
+  bucket: chocolate-results
+  region: us-west-2

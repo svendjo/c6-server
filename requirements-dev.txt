@@ -2,5 +2,8 @@ fastapi==0.115.6
 numpy==1.26.4
 pillow==11.1.0
 python-multipart==0.0.20
-tensorflow==2.16.2
+PyYAML==6.0.2           # config.py loads config/<APP_ENV>.yaml
+boto3==1.35.99          # only needed to run APP_ENV=aws-prod locally (S3 results store)
+tensorflow==2.16.2      # stands in for prod's tflite-runtime (see the import in server.py)
 uvicorn==0.34.0
+watchfiles==0.24.0      # enables `reload: true` auto-restart on code changes (dev only)

@@ -1,86 +1,382 @@
+"""Count Chocolate II HTTP service: count the chocolate chips in a photo of a cookie.
+
+Endpoints:
+    POST /predict   a JPEG -> the chip count + whether it is a cookie at all,
+                    saved as a per-prediction folder in the results store
+    GET  /health    liveness probe + whether the models loaded
+
+Two TFLite models run per request: a regression CNN that counts chips from a
+300x300 image, and a MobileNetV2 classifier that decides cookie / not cookie from a
+224x224 one. Below `confidence_threshold` the classification is reported as
+"Uncertain". Both model filenames, the threshold, and where results are saved come
+from config/<APP_ENV>.yaml -- see config.py.
+
+Errors distinguish what the caller can fix from what they can't, so the UI can say
+something better than "something went wrong":
+
+    400  not a JPEG, or not an image at all (also empty or truncated)
+    413  the upload is over 20 MB, or decodes to an absurd number of pixels
+    422  it isn't a cookie -- the classifier is the gate, so there is no count
+    503  the models aren't loaded -- the service is up but can't predict
+    500  anything else, i.e. our bug
+
+The 4xx/503 bodies are `{"detail": {"message": ..., "hint": ..., "id": ...}}`:
+`message` is safe to show the user, `hint` tells them what to do about it. (FastAPI
+answers a request with no `file` field at all with its own 422, whose `detail` is a
+list rather than this object -- a client should treat a detail without a `message`
+as the generic case.) A 500 says only that something broke on our side and gives
+the prediction `id` to quote -- the exception itself goes to the log and to
+error.txt in the saved folder, not to the client.
+"""
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+from datetime import datetime
+from functools import lru_cache
+import hashlib
+import json
+import io
+import os
+
 try:
     from tflite_runtime.interpreter import Interpreter as tflite
 except ImportError:
-    from tensorflow.lite.interpreter import Interpreter as tflite
-from PIL import Image
+    # Production installs the small tflite-runtime wheel; a dev machine has full
+    # TensorFlow (requirements-dev.txt), whose bundled interpreter is API-compatible
+    # for what we do here. tf.lite is lazily loaded, so it must be reached via
+    # attribute access -- `from tensorflow.lite import Interpreter` does not trigger
+    # the lazy loader and fails on TF 2.16 (as the previous fallback import did).
+    import tensorflow as tf
+    tflite = tf.lite.Interpreter
+from PIL import Image, UnidentifiedImageError
 import numpy as np
-import io
 
-app = FastAPI()
+import config
+import results_store
+
+CLASS_LABEL_BY_ID = {0: "Not Cookie", 1: "Cookie"}
+
+# Only JPEG is accepted. The UI says so and its file input filters for it, so this
+# is the server agreeing rather than a new restriction -- and the models were
+# trained on photos, not screenshots or transparent PNGs.
+ACCEPTED_FORMATS = ("JPEG",)
+
+# Refuse anything over 20 MB. Checked before decoding, on the raw bytes: it's the
+# cheap test, and it means a huge upload never reaches the decoder. (The body is
+# still buffered by the ASGI server before this runs -- capping it earlier would
+# take a middleware reading Content-Length, which isn't worth it at this scale.)
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+
+class Refused(Exception):
+    """We won't produce a count, and the caller is the one who can act on it.
+
+    Covers the whole 4xx family: the upload isn't a usable JPEG (400), it's too big
+    (413), or it isn't a cookie (422). Carries the status plus a message safe to show
+    the user and a hint at what to do about it, so /predict answers with something
+    actionable instead of folding every failure into a 500.
+    """
+
+    def __init__(self, message, hint, status=400, extra=None):
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+        self.status = status
+        # Anything else the client should get in `detail` -- the 422 uses it to pass
+        # the classifier's verdict, so the UI can show its own not-a-cookie dialog
+        # instead of a generic error.
+        self.extra = extra or {}
+
+# Each model's expected input side length, in pixels. The models are square and
+# take NHWC float32 in [0, 1]; these have to match how they were trained in
+# c6-models (Counting.ipynb at 300, Classification.ipynb at 224).
+INPUT_SIZE = {"counting": (300, 300), "classification": (224, 224)}
+
+
+@asynccontextmanager
+async def lifespan(app):
+    """Validate the environment and report it, once, as the app starts serving.
+
+    `config.validate()` fails the boot on a YAML that names a missing model or an
+    unknown results backend -- loudly, at startup, rather than on the first request.
+    Then the models are actually loaded, so a corrupt .tflite shows up here too
+    instead of surfacing as a 503 later.
+    """
+    config.validate()
+    print(f"Environment: APP_ENV={config.APP_ENV}")
+    for kind in ("counting", "classification"):
+        loaded = interpreter(kind) is not None
+        print(f"Model {kind}: {config.MODELS.get(kind)}"
+              f"{'' if loaded else '  [NOT LOADABLE -- /predict will 503]'}")
+    print(f"Confidence threshold: {config.CONFIDENCE_THRESHOLD}")
+    print(f"Results store: {config.RESULTS.get('backend', 'local')}")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["POST"],
+    allow_methods=["GET", "POST"],  # GET for /health, POST for /predict
     allow_headers=["*"],
 )
 
-# Load the counting model
-counting_model_interpreter = tflite(model_path='counting-model0926.tflite')
-counting_model_interpreter.allocate_tensors()
-model_input_details = counting_model_interpreter.get_input_details()
-model_output_details = counting_model_interpreter.get_output_details()
 
-# Load the classification model
-classification_mocel_interpreter = tflite(model_path='classification-model0927.tflite')
-classification_mocel_interpreter.allocate_tensors()
-classification_input_details = classification_mocel_interpreter.get_input_details()
-classification_output_details = classification_mocel_interpreter.get_output_details()
+@lru_cache(maxsize=None)
+def interpreter(kind):
+    """The allocated TFLite interpreter for "counting" / "classification", or None.
 
-
-def preprocess_image(image, target_size=(300, 300)):
-    image = image.resize(target_size)  # Resize the image to match your model's input size
-    image = np.array(image, dtype=np.float32) / 255.0  # Normalize the image
-    image = np.expand_dims(image, axis=0)  # Add batch dimension
-    print(image.shape)
-
-    return image
+    Loaded on first use and cached, rather than at import: a missing or corrupt
+    model file then becomes a 503 with a message instead of a stack trace that
+    kills the process, and importing this module (e.g. from a notebook) costs
+    nothing. Returns None on failure -- `ready()` is what callers gate on.
+    """
+    try:
+        interp = tflite(model_path=str(config.model_path(kind)))
+        interp.allocate_tensors()
+        return interp
+    except Exception as e:  # noqa: BLE001 -- report, don't crash the process
+        print(f"WARNING: couldn't load the {kind} model: {e}")
+        return None
 
 
-CLASS_LABEL_BY_ID = {0: "Not Cookie", 1: "Cookie"}
-CONFIDENCE_THRESHOLD = 0.8
+def ready():
+    """True when both models are loaded -- a prediction needs them both."""
+    return all(interpreter(k) is not None for k in ("counting", "classification"))
+
+
+def describe():
+    return ", ".join(f"{k}={config.MODELS.get(k)}"
+                     for k in ("counting", "classification"))
+
+
+@lru_cache(maxsize=1)
+def store():
+    """Per-environment results storage (local dir or S3 bucket), built on first use."""
+    return results_store.make_store(config.RESULTS)
+
+
+def decode_upload(contents):
+    """The uploaded bytes -> an RGB PIL image, or Refused if they aren't a usable JPEG.
+
+    Everything the caller can get wrong about the *file* is caught here and turned
+    into a 400/413, so the only exceptions that escape /predict are genuinely ours.
+    `load()` forces the decode to happen now: Image.open is lazy, so a truncated file
+    would otherwise blow up later, inside the resize, as an opaque 500.
+    """
+    if not contents:
+        raise Refused("The upload was empty.",
+                      "Choose a photo of a cookie and try again.")
+    if len(contents) > MAX_UPLOAD_BYTES:
+        mb = len(contents) / 1024 / 1024
+        raise Refused(f"That file is too large ({mb:.0f} MB).",
+                      f"Photos must be under {MAX_UPLOAD_BYTES // 1024 // 1024} MB.",
+                      status=413)
+    try:
+        image = Image.open(io.BytesIO(contents))
+        image.load()
+    except Image.DecompressionBombError:
+        # Pillow's guard against a small file that decodes to a huge bitmap -- a 20 MB
+        # JPEG can still claim enormous dimensions, so the byte cap above doesn't
+        # cover this. Same 413: it's too big, just measured in pixels.
+        raise Refused("That image is too large to process.",
+                      "Resize it and try again.",
+                      status=413)
+    except UnidentifiedImageError:
+        raise Refused("That file isn't an image we can read.",
+                      "Upload a JPG photo of a cookie.")
+    except OSError as e:
+        # Recognized as an image, but the bytes are damaged (the classic being a
+        # half-uploaded JPEG: "image file is truncated"). Pillow's wording goes to
+        # the log, not into the message -- "6 bytes not processed" means nothing to
+        # someone holding a phone.
+        print(f"Rejecting a damaged image: {type(e).__name__}: {e}")
+        raise Refused("That image file is damaged or incomplete.",
+                      "Try uploading it again, or use a different photo.")
+
+    if image.format not in ACCEPTED_FORMATS:
+        # `format` is only set by Image.open, and is lost by convert() below, so it
+        # has to be read here.
+        raise Refused(f"{image.format or 'That file'} images aren't supported.",
+                      "Upload a JPG photo of a cookie.")
+
+    # A JPEG can still be greyscale or CMYK; the models were trained on RGB.
+    return image.convert("RGB")
+
+
+def preprocess_image(image, target_size):
+    """A PIL image -> the NHWC float32 batch of one the models were trained on."""
+    image = image.resize(target_size)
+    image = np.array(image, dtype=np.float32) / 255.0  # normalize to [0, 1]
+    return np.expand_dims(image, axis=0)  # add the batch dimension
+
+
+def infer(kind, image):
+    """Run `image` through the named model and return its raw output tensor."""
+    interp = interpreter(kind)
+    input_details = interp.get_input_details()
+    output_details = interp.get_output_details()
+    interp.set_tensor(input_details[0]["index"],
+                      preprocess_image(image, INPUT_SIZE[kind]))
+    interp.invoke()
+    return interp.get_tensor(output_details[0]["index"])
+
+
+def _new_result_id():
+    return f"{datetime.now():%Y%m%d}-{hashlib.sha256(os.urandom(16)).hexdigest()[:6]}"
+
+
+def _start_result(result_id):
+    """Open a working directory for this prediction, or None if the store is broken.
+
+    Never raises: saving is for later debugging and ground truth, so a misconfigured
+    or unreachable store must not cost the caller their answer -- it costs a warning
+    in the log instead.
+    """
+    try:
+        return store().new_working_dir(result_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"WARNING: couldn't open the results store: {e}")
+        return None
+
+
+def _write(out_dir, name, data):
+    """Write one artifact into the working directory. Never raises."""
+    if out_dir is None:
+        return
+    try:
+        path = out_dir / name
+        path.write_bytes(data) if isinstance(data, bytes) else path.write_text(data)
+    except Exception as e:  # noqa: BLE001
+        print(f"WARNING: couldn't save {name}: {e}")
+
+
+def _finish_result(result_id, out_dir):
+    """Finalize the folder (S3: upload it) and return where it landed, or None."""
+    if out_dir is None:
+        return None
+    try:
+        store().commit(result_id, out_dir)
+        return store().describe(result_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"WARNING: couldn't save this prediction: {e}")
+        return None
+
+
+@app.get("/health")
+async def health():
+    """Liveness/readiness probe.
+
+    App Runner's health check is currently TCP, which only needs the port open, but
+    /predict is a POST -- so if that check is ever switched to HTTP there is
+    something for it to call. `ready` reports whether both models loaded.
+    """
+    return {"ok": True, "models": describe(), "ready": ready()}
 
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
+    if not ready():
+        # 503, not 500: the service is up, it just can't predict -- and no amount of
+        # retrying by the caller will change that, so say so plainly.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "The chip counter isn't available right now.",
+                "hint": "This is a deployment problem, not yours -- try again later.",
+                "detail": f"The models could not be loaded ({describe()}). Train them "
+                          "in c6-models and point config/<APP_ENV>.yaml at the .tflite "
+                          "files.",
+            },
+        )
+
+    result_id = _new_result_id()
+    out_dir = _start_result(result_id)
     try:
-        # Read and process the image
         contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
-        processed_image300 = preprocess_image(image)
+        # Save the input before predicting: an image that crashes the pipeline is
+        # exactly the one worth keeping.
+        _write(out_dir, "input.jpg", contents)
 
-        # Run inference on the counting model
-        counting_model_interpreter.set_tensor(model_input_details[0]['index'], processed_image300)
-        counting_model_interpreter.invoke()
-        chocolate_chips = counting_model_interpreter.get_tensor(model_output_details[0]['index'])
-        print(f"chips: {chocolate_chips}")
+        image = decode_upload(contents)
 
-        # Run inference on the classification model
-        processed_image224 = preprocess_image(image, target_size=(224, 224))
-        classification_mocel_interpreter.set_tensor(classification_input_details[0]['index'], processed_image224)
-        classification_mocel_interpreter.invoke()
-        probabilities = classification_mocel_interpreter.get_tensor(classification_output_details[0]['index'])[0]
-        print(f"probabilities [{CLASS_LABEL_BY_ID.values()}]: {probabilities}")
-        max_confidence = np.max(probabilities)
-        class_id = np.argmax(probabilities)
-        print(f"classification: {CLASS_LABEL_BY_ID[class_id]}")
+        # Classify FIRST, and treat it as a gate. A chip count for something that
+        # isn't a cookie is a meaningless number, so don't compute one and don't
+        # return 200 with a verdict buried in a field the client has to notice.
+        probabilities = infer("classification", image)[0]
+        max_confidence = float(np.max(probabilities))
+        class_id = int(np.argmax(probabilities))
+        # Below the threshold the classifier isn't sure enough to commit either way.
+        verdict = (CLASS_LABEL_BY_ID[class_id]
+                   if max_confidence >= config.CONFIDENCE_THRESHOLD else "Uncertain")
+        print(f"Classified {result_id}: {verdict} (confidence {max_confidence:.3f}, "
+              f"probabilities {probabilities.tolist()})")
 
-        # Determine prediction based on confidence threshold
-        if max_confidence >= CONFIDENCE_THRESHOLD:
-            prediction_text = CLASS_LABEL_BY_ID[class_id]
-        else:
-            prediction_text = "Uncertain"
+        if verdict != "Cookie":
+            _write(out_dir, "prediction.json", json.dumps(
+                {"id": result_id, "prediction_text": verdict,
+                 "confidence": round(max_confidence, 4)}, indent=2) + "\n")
+            raise Refused(
+                "That is not a cookie!" if verdict == "Not Cookie"
+                else "The count cannot tell whether that is a cookie.",
+                "Upload a clear, well-lit photo of a single cookie.",
+                status=422,
+                extra={"prediction_text": verdict,
+                       "confidence": round(max_confidence, 4)},
+            )
 
-        return {"prediction": chocolate_chips.tolist(), "prediction_text": prediction_text}
-
+        chocolate_chips = infer("counting", image)
+        payload = {
+            "id": result_id,
+            "prediction": chocolate_chips.tolist(),
+            "prediction_text": verdict,
+            "confidence": round(max_confidence, 4),
+        }
+        print(f"Prediction {result_id}: chips={payload['prediction']}")
+        _write(out_dir, "prediction.json", json.dumps(payload, indent=2) + "\n")
+    except Refused as e:
+        # The caller's problem, and one they can act on: say what was wrong and what
+        # to do instead. `prediction_text` is only set on the 422 -- it lets the UI
+        # show its own not-a-cookie dialog rather than a generic error.
+        print(f"Refused {result_id}: {e.status} {e.message}")
+        if not e.extra:
+            # A rejected *file*, so there is no prediction.json -- record why.
+            # (The not-a-cookie 422 already wrote one: its verdict is the result.)
+            _write(out_dir, "error.txt", f"{e.status} {e.message}\n")
+        raise HTTPException(
+            status_code=e.status,
+            detail={"message": e.message, "hint": e.hint, "id": result_id, **e.extra},
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Our problem. The client gets the id to quote and nothing else -- the
+        # exception text can name internal paths and model files, and it wouldn't
+        # mean anything to whoever uploaded the photo. It goes to the log and to
+        # error.txt in the saved folder, which is what the id is for.
+        print(f"ERROR: prediction {result_id} failed: {type(e).__name__}: {e}")
+        _write(out_dir, "error.txt", f"{type(e).__name__}: {e}\n")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Something went wrong counting the chips.",
+                "hint": "Try again; if it keeps happening, quote this id.",
+                "id": result_id,
+            },
+        )
+    finally:
+        # Runs on both paths, so a failed prediction still leaves its input behind.
+        saved_as = _finish_result(result_id, out_dir)
+
+    payload["saved_as"] = saved_as
+    return payload
+
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    # `reload: true` (local-dev.yaml) auto-restarts the server when a .py file
+    # changes. Reload requires the import-string form ("server:app") rather than the
+    # app object, and the `watchfiles` package (pip install watchfiles).
+    uvicorn.run("server:app", host="0.0.0.0", port=8080, reload=config.RELOAD)
