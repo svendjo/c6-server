@@ -24,8 +24,23 @@ response because the client keys its dialogs off it. `saved_as` is `null` if the
 results store was unreachable — saving never costs the caller their answer, it just
 logs a warning.
 
-Uploads must be **JPG, under 20 MB**. The format is checked from the bytes rather
-than the filename or content-type, so renaming a PNG doesn't get it past the gate.
+Uploads must be a **common image format, under 20 MB** — JPEG, the MPO an iPhone
+actually writes into a `.jpg`, HEIC, PNG, WEBP, GIF, BMP, TIFF or JPEG 2000. The
+exact set is `predictor.ACCEPTED_FORMATS`, and it is checked from the image bytes
+rather than the filename or content-type, so a `.jpg` that is really something else
+is judged on what it is — in both directions.
+
+Two notes on that. **MPO is the common case, not an exotic one**: an iPhone writes a
+multi-picture JPEG into a file named `.jpg`, so a JPEG-only check refuses most phone
+photos outright — 54 of the 62 images in c6-models' own dataset are MPO. And
+**transparency is flattened onto white**. A bare `convert("RGB")` discards the alpha
+band rather than compositing it, handing back whatever undefined colour sits in the
+transparent pixels — commonly black, which is how a cut-out PNG would otherwise
+arrive with a large dark region that the counting model reads as chips.
+
+HEIC needs `pillow-heif`, which is in `requirements.txt`; its wheel vendors libheif,
+so no system packages are involved. Without it, HEIC uploads are refused by name
+rather than as "not an image".
 
 `GET /health` → `{"ok": true, "models": "...", "ready": true}`. `ready` is false when
 a model file is missing or corrupt.
@@ -36,7 +51,7 @@ than "something went wrong":
 
 | Status | When | |
 |---|---|---|
-| **400** | not a JPG, or not an image at all (also empty or truncated) | caller can fix it |
+| **400** | not an image format we can read (also empty or truncated) | caller can fix it |
 | **413** | the upload is over 20 MB, or decodes to an absurd number of pixels | caller can fix it |
 | **422** | **it isn't a cookie** — the classifier is a gate, so there is no count | caller can fix it |
 | **422** | no `file` field at all (FastAPI's own validation) | caller can fix it |
@@ -48,7 +63,7 @@ The 4xx/503 bodies are `{"detail": {"message": ..., "hint": ..., "id": ...}}` �
 
 ```json
 {"detail": {"message": "That file isn't an image we can read.",
-            "hint": "Upload a JPG photo of a cookie.",
+            "hint": "Upload a photo of a cookie in a common image format.",
             "id": "20260730-85d461"}}
 ```
 

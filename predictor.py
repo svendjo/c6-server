@@ -1,9 +1,9 @@
 """The two models: cookie / not cookie, and how many chips are in it.
 
-Everything between a PIL image and a number lives here -- loading the TFLite
-interpreters, the preprocessing the models were trained on, and the decode rule
-for each output. Imports no web framework, so a notebook can use it without
-pulling in FastAPI:
+Everything between an image file and a number lives here -- which formats we can
+read, loading the TFLite interpreters, the preprocessing the models were trained
+on, and the decode rule for each output. Imports no web framework, so a notebook
+can use it without pulling in FastAPI:
 
     import sys, os
     sys.path.insert(0, os.path.abspath("../c6-server"))
@@ -36,9 +36,76 @@ except ImportError:
 from PIL import Image
 import numpy as np
 
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    # HEIC/HEIF then simply stays unreadable and an upload of one is refused by name
+    # rather than as "not an image". The wheel vendors its own libheif, so this only
+    # trips if the package itself is missing.
+    pass
+
 import config
 
 CLASS_LABEL_BY_ID = {0: "Not Cookie", 1: "Cookie"}
+
+# The image formats we accept. Pillow reads about forty; these are the ones a phone,
+# camera, screenshot tool, or browser actually produces, and each decodes to a still
+# raster with no external tooling. The rest -- scientific containers, game textures,
+# anything needing Ghostscript -- are refused, because they would fail somewhere
+# less legible than the front door.
+#
+# MPO is the one that matters in practice: an iPhone writes a multi-picture JPEG
+# into a file named .jpg, so `format` reads "MPO" and a JPEG-only check refuses the
+# single most common upload there is. 54 of the 62 photos in c6-models' own dataset
+# are MPO, which is how this was found.
+#
+# HEIF (iPhone's default unless the camera is set to "Most Compatible") is readable
+# only when pillow-heif is installed, registered above. It is listed here either
+# way, so a HEIC upload on an install without it is refused by name.
+ACCEPTED_FORMATS = (
+    "JPEG", "MPO",          # photographs; MPO is what iPhones write into a .jpg
+    "HEIF",                 # iPhone default -- needs pillow-heif
+    "PNG", "WEBP", "GIF",   # the web set; all three can carry transparency
+    "BMP", "DIB",           # Windows bitmaps, and some scanners
+    "TIFF",                 # scanners and camera exports
+    "JPEG2000",
+)
+
+# The same set as filename suffixes, for walking a directory of training images --
+# c6-models globs with this so the dataset and the server agree on what counts as
+# an image. Kept beside ACCEPTED_FORMATS deliberately: they have to change together.
+ACCEPTED_EXTENSIONS = (
+    ".jpg", ".jpeg", ".jpe", ".mpo",
+    ".heic", ".heif",
+    ".png", ".webp", ".gif",
+    ".bmp", ".dib",
+    ".tif", ".tiff",
+    ".jp2", ".j2k", ".jpf", ".jpx",
+)
+
+
+def to_rgb(image):
+    """A decoded PIL image -> RGB, with any transparency flattened onto white.
+
+    The models were trained on photographs, which have no alpha channel. A bare
+    .convert("RGB") doesn't composite transparency, it just DISCARDS the alpha band
+    and hands back whatever colour happens to be stored in the transparent pixels.
+    That colour is undefined -- exporters commonly leave it black, which puts a
+    large dark region into exactly the images likely to have one (cut-out PNGs and
+    WEBPs), and a chip detector reads dark blobs as chips. Compositing gives a
+    defined result instead, and white is both the safer error and closer to what a
+    photo of a cookie on a plate looks like.
+
+    Greyscale, CMYK and palette images fall through the same convert at the end,
+    which is why this is worth routing every image through and not just the ones
+    that can carry alpha.
+    """
+    if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
+        image = image.convert("RGBA")
+        white = Image.new("RGBA", image.size, (255, 255, 255, 255))
+        image = Image.alpha_composite(white, image)
+    return image.convert("RGB")
 
 # Each model's expected input side length, in pixels. The models are square and
 # take NHWC float32 in [0, 1]; these have to match how they were trained in

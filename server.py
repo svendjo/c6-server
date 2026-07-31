@@ -6,10 +6,16 @@ Endpoints:
     GET  /health    liveness probe + whether the models loaded
 
 This module is the HTTP layer: it decodes and vets the upload, calls the models,
-shapes the response, and saves the artifacts. The models themselves -- loading
-them, the preprocessing they expect, and the decode rule for each output -- live
-in predictor.py, which imports no web framework so that c6-models' notebooks can
-share exactly this preprocessing instead of reimplementing it.
+shapes the response, and saves the artifacts. The models themselves -- which
+formats we can read, loading them, the preprocessing they expect, and the decode
+rule for each output -- live in predictor.py, which imports no web framework so
+that c6-models' notebooks can share exactly this preprocessing instead of
+reimplementing it.
+
+Uploads may be in any of the common photo and web formats (JPEG, the MPO an
+iPhone actually writes, HEIC, PNG, WEBP, GIF, BMP, TIFF, JPEG 2000) -- the exact
+set is predictor.ACCEPTED_FORMATS. The format is read from the image bytes, never
+from the filename.
 
 Two TFLite models run per request: a regression CNN that counts chips from a
 300x300 image, and a MobileNetV2 classifier that decides cookie / not cookie from a
@@ -20,7 +26,7 @@ from config/<APP_ENV>.yaml -- see config.py.
 Errors distinguish what the caller can fix from what they can't, so the UI can say
 something better than "something went wrong":
 
-    400  not a JPEG, or not an image at all (also empty or truncated)
+    400  not an image format we can read (also empty or truncated)
     413  the upload is over 20 MB, or decodes to an absurd number of pixels
     422  it isn't a cookie -- the classifier is the gate, so there is no count
     503  the models aren't loaded -- the service is up but can't predict
@@ -50,10 +56,10 @@ import config
 import predictor
 import results_store
 
-# Only JPEG is accepted. The UI says so and its file input filters for it, so this
-# is the server agreeing rather than a new restriction -- and the models were
-# trained on photos, not screenshots or transparent PNGs.
-ACCEPTED_FORMATS = ("JPEG",)
+# Which formats count as a readable image lives in predictor.ACCEPTED_FORMATS, next
+# to the code that decodes them. The set is deliberately wide -- the common photo
+# and web formats -- because the format a file happens to be in says nothing about
+# whether it shows a cookie, and the classifier is already the gate for that.
 
 # Refuse anything over 20 MB. Checked before decoding, on the raw bytes: it's the
 # cheap test, and it means a huge upload never reaches the decoder. (The body is
@@ -121,7 +127,7 @@ def store():
 
 
 def decode_upload(contents):
-    """The uploaded bytes -> an RGB PIL image, or Refused if they aren't a usable JPEG.
+    """The uploaded bytes -> an RGB PIL image, or Refused if they aren't a usable image.
 
     Everything the caller can get wrong about the *file* is caught here and turned
     into a 400/413, so the only exceptions that escape /predict are genuinely ours.
@@ -148,7 +154,7 @@ def decode_upload(contents):
                       status=413)
     except UnidentifiedImageError:
         raise Refused("That file isn't an image we can read.",
-                      "Upload a JPG photo of a cookie.")
+                      "Upload a photo of a cookie in a common image format.")
     except OSError as e:
         # Recognized as an image, but the bytes are damaged (the classic being a
         # half-uploaded JPEG: "image file is truncated"). Pillow's wording goes to
@@ -158,14 +164,18 @@ def decode_upload(contents):
         raise Refused("That image file is damaged or incomplete.",
                       "Try uploading it again, or use a different photo.")
 
-    if image.format not in ACCEPTED_FORMATS:
-        # `format` is only set by Image.open, and is lost by convert() below, so it
-        # has to be read here.
+    if image.format not in predictor.ACCEPTED_FORMATS:
+        # `format` is only set by Image.open, and is lost by the conversion below, so
+        # it has to be read here. Naming the format tells the caller something they
+        # can act on -- "HEIF images aren't supported" beats a generic refusal when
+        # the fix is to re-export the photo.
         raise Refused(f"{image.format or 'That file'} images aren't supported.",
-                      "Upload a JPG photo of a cookie.")
+                      "Upload a photo of a cookie in a common image format.")
 
-    # A JPEG can still be greyscale or CMYK; the models were trained on RGB.
-    return image.convert("RGB")
+    # Any of these can be greyscale, CMYK, palette, or carry an alpha channel; the
+    # models were trained on RGB photographs. Transparency is flattened onto white
+    # rather than the black a bare convert() would give -- see predictor.to_rgb.
+    return predictor.to_rgb(image)
 
 
 def _new_result_id():
@@ -241,7 +251,10 @@ async def predict(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         # Save the input before predicting: an image that crashes the pipeline is
-        # exactly the one worth keeping.
+        # exactly the one worth keeping. The .jpg is nominal -- the bytes are saved
+        # verbatim in whatever format they arrived in, and the format isn't known
+        # until the decode below, which is deliberately after this point. Everything
+        # that reads these folders sniffs the content anyway.
         _write(out_dir, "input.jpg", contents)
 
         image = decode_upload(contents)
