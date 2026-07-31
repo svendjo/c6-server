@@ -77,6 +77,21 @@ Both are loaded **lazily on first use** and cached, so a bad model file becomes 
 with a message rather than an import-time crash. Their filenames live in
 `config/<APP_ENV>.yaml`, not in the source — see below.
 
+Everything between a PIL image and a number lives in **`predictor.py`** — loading the
+interpreters, the preprocessing the models expect, and the decode rule for each
+output (`classify`, `count_chips`, `decide_verdict`). `server.py` is the HTTP layer
+around it: it vets the upload, calls those, and shapes the response.
+
+The split exists so that **c6-models' notebooks can import the same preprocessing
+instead of reimplementing it** (`sys.path.insert(...); import predictor`, the same
+pattern abi-models uses against abi-server). They previously had their own copy and
+it drifted: the notebooks resize through Keras, whose default interpolation is
+`nearest`, while the server used Pillow's `resize` default of **bicubic** — so both
+deployed models were being served images preprocessed unlike anything they were
+trained on. Over the 62 dataset photos that moved the predicted chip count by 0.70 on
+average and up to 1.78. `predictor.RESAMPLE` is now the single definition, and both
+notebooks pass it explicitly to Keras rather than relying on a default.
+
 ## Configuration
 One YAML per environment in `config/`, selected by the `APP_ENV` environment
 variable (default `local-dev`; the Dockerfile sets `aws-prod`):

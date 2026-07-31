@@ -5,6 +5,12 @@ Endpoints:
                     saved as a per-prediction folder in the results store
     GET  /health    liveness probe + whether the models loaded
 
+This module is the HTTP layer: it decodes and vets the upload, calls the models,
+shapes the response, and saves the artifacts. The models themselves -- loading
+them, the preprocessing they expect, and the decode rule for each output -- live
+in predictor.py, which imports no web framework so that c6-models' notebooks can
+share exactly this preprocessing instead of reimplementing it.
+
 Two TFLite models run per request: a regression CNN that counts chips from a
 300x300 image, and a MobileNetV2 classifier that decides cookie / not cookie from a
 224x224 one. Below `confidence_threshold` the classification is reported as
@@ -38,23 +44,11 @@ import json
 import io
 import os
 
-try:
-    from tflite_runtime.interpreter import Interpreter as tflite
-except ImportError:
-    # Production installs the small tflite-runtime wheel; a dev machine has full
-    # TensorFlow (requirements-dev.txt), whose bundled interpreter is API-compatible
-    # for what we do here. tf.lite is lazily loaded, so it must be reached via
-    # attribute access -- `from tensorflow.lite import Interpreter` does not trigger
-    # the lazy loader and fails on TF 2.16 (as the previous fallback import did).
-    import tensorflow as tf
-    tflite = tf.lite.Interpreter
 from PIL import Image, UnidentifiedImageError
-import numpy as np
 
 import config
+import predictor
 import results_store
-
-CLASS_LABEL_BY_ID = {0: "Not Cookie", 1: "Cookie"}
 
 # Only JPEG is accepted. The UI says so and its file input filters for it, so this
 # is the server agreeing rather than a new restriction -- and the models were
@@ -87,11 +81,6 @@ class Refused(Exception):
         # instead of a generic error.
         self.extra = extra or {}
 
-# Each model's expected input side length, in pixels. The models are square and
-# take NHWC float32 in [0, 1]; these have to match how they were trained in
-# c6-models (Counting.ipynb at 300, Classification.ipynb at 224).
-INPUT_SIZE = {"counting": (300, 300), "classification": (224, 224)}
-
 
 @asynccontextmanager
 async def lifespan(app):
@@ -105,7 +94,7 @@ async def lifespan(app):
     config.validate()
     print(f"Environment: APP_ENV={config.APP_ENV}")
     for kind in ("counting", "classification"):
-        loaded = interpreter(kind) is not None
+        loaded = predictor.interpreter(kind) is not None
         print(f"Model {kind}: {config.MODELS.get(kind)}"
               f"{'' if loaded else '  [NOT LOADABLE -- /predict will 503]'}")
     print(f"Confidence threshold: {config.CONFIDENCE_THRESHOLD}")
@@ -123,34 +112,6 @@ app.add_middleware(
     allow_methods=["GET", "POST"],  # GET for /health, POST for /predict
     allow_headers=["*"],
 )
-
-
-@lru_cache(maxsize=None)
-def interpreter(kind):
-    """The allocated TFLite interpreter for "counting" / "classification", or None.
-
-    Loaded on first use and cached, rather than at import: a missing or corrupt
-    model file then becomes a 503 with a message instead of a stack trace that
-    kills the process, and importing this module (e.g. from a notebook) costs
-    nothing. Returns None on failure -- `ready()` is what callers gate on.
-    """
-    try:
-        interp = tflite(model_path=str(config.model_path(kind)))
-        interp.allocate_tensors()
-        return interp
-    except Exception as e:  # noqa: BLE001 -- report, don't crash the process
-        print(f"WARNING: couldn't load the {kind} model: {e}")
-        return None
-
-
-def ready():
-    """True when both models are loaded -- a prediction needs them both."""
-    return all(interpreter(k) is not None for k in ("counting", "classification"))
-
-
-def describe():
-    return ", ".join(f"{k}={config.MODELS.get(k)}"
-                     for k in ("counting", "classification"))
 
 
 @lru_cache(maxsize=1)
@@ -207,24 +168,6 @@ def decode_upload(contents):
     return image.convert("RGB")
 
 
-def preprocess_image(image, target_size):
-    """A PIL image -> the NHWC float32 batch of one the models were trained on."""
-    image = image.resize(target_size)
-    image = np.array(image, dtype=np.float32) / 255.0  # normalize to [0, 1]
-    return np.expand_dims(image, axis=0)  # add the batch dimension
-
-
-def infer(kind, image):
-    """Run `image` through the named model and return its raw output tensor."""
-    interp = interpreter(kind)
-    input_details = interp.get_input_details()
-    output_details = interp.get_output_details()
-    interp.set_tensor(input_details[0]["index"],
-                      preprocess_image(image, INPUT_SIZE[kind]))
-    interp.invoke()
-    return interp.get_tensor(output_details[0]["index"])
-
-
 def _new_result_id():
     return f"{datetime.now():%Y%m%d}-{hashlib.sha256(os.urandom(16)).hexdigest()[:6]}"
 
@@ -274,12 +217,12 @@ async def health():
     /predict is a POST -- so if that check is ever switched to HTTP there is
     something for it to call. `ready` reports whether both models loaded.
     """
-    return {"ok": True, "models": describe(), "ready": ready()}
+    return {"ok": True, "models": predictor.describe(), "ready": predictor.ready()}
 
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    if not ready():
+    if not predictor.ready():
         # 503, not 500: the service is up, it just can't predict -- and no amount of
         # retrying by the caller will change that, so say so plainly.
         raise HTTPException(
@@ -287,9 +230,9 @@ async def predict(file: UploadFile = File(...)):
             detail={
                 "message": "The chip counter isn't available right now.",
                 "hint": "This is a deployment problem, not yours -- try again later.",
-                "detail": f"The models could not be loaded ({describe()}). Train them "
-                          "in c6-models and point config/<APP_ENV>.yaml at the .tflite "
-                          "files.",
+                "detail": f"The models could not be loaded ({predictor.describe()}). "
+                          "Train them in c6-models and point config/<APP_ENV>.yaml "
+                          "at the .tflite files.",
             },
         )
 
@@ -306,12 +249,7 @@ async def predict(file: UploadFile = File(...)):
         # Classify FIRST, and treat it as a gate. A chip count for something that
         # isn't a cookie is a meaningless number, so don't compute one and don't
         # return 200 with a verdict buried in a field the client has to notice.
-        probabilities = infer("classification", image)[0]
-        max_confidence = float(np.max(probabilities))
-        class_id = int(np.argmax(probabilities))
-        # Below the threshold the classifier isn't sure enough to commit either way.
-        verdict = (CLASS_LABEL_BY_ID[class_id]
-                   if max_confidence >= config.CONFIDENCE_THRESHOLD else "Uncertain")
+        verdict, max_confidence, probabilities = predictor.classify(image)
         print(f"Classified {result_id}: {verdict} (confidence {max_confidence:.3f}, "
               f"probabilities {probabilities.tolist()})")
 
@@ -328,10 +266,16 @@ async def predict(file: UploadFile = File(...)):
                        "confidence": round(max_confidence, 4)},
             )
 
-        chocolate_chips = infer("counting", image)
+        chocolate_chips = predictor.count_chips(image)
         payload = {
             "id": result_id,
-            "prediction": chocolate_chips.tolist(),
+            # Wrapped in two lists because that is the shape the counting model's
+            # output tensor had when this endpoint was written, and c6-www leans on
+            # it: `Math.round([[6.94]])` happens to give 7 by way of JS coercing a
+            # single-element nested array to a number. Unwrapping it to a plain
+            # float would work with today's frontend and read far better -- but it
+            # is an API change, not a refactor, so it stays until it's asked for.
+            "prediction": [[chocolate_chips]],
             "prediction_text": verdict,
             "confidence": round(max_confidence, 4),
         }
