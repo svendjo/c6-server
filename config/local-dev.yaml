@@ -7,6 +7,14 @@ models:
   counting: counting-model0926.tflite             # 300x300 -> chocolate chip count
   classification: classification-model0927.tflite  # 224x224 -> cookie / not cookie
 
+# Same limit as prod, so what you test is what ships. Every local request comes from
+# 127.0.0.1 and therefore shares one bucket -- if 20 an hour gets in the way while
+# working on something else, raise `requests` or delete the block to switch limiting
+# off entirely.
+rate_limit:
+  requests: 20
+  window_seconds: 3600
+
 results:
   backend: local            # results/<id>/ on local disk
   dir: results

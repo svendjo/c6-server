@@ -7,9 +7,9 @@ one with the APP_ENV env var (default "local-dev"), e.g.:
     APP_ENV=aws-prod python server.py     # aws-prod
 
 The file carries the run flags (reload), the model filenames, the classifier's
-confidence threshold, and the results-storage backend, so the run command itself
-stays just `python server.py` and a retrained model is a config change rather than
-an edit in the source.
+confidence threshold, the results-storage backend, and the /predict rate limit, so
+the run command itself stays just `python server.py` and a retrained model is a
+config change rather than an edit in the source.
 """
 import os
 from pathlib import Path
@@ -46,6 +46,22 @@ RELOAD = bool(CONFIG.get("reload"))
 CONFIDENCE_THRESHOLD = float(CONFIG.get("confidence_threshold", 0.8))
 RESULTS = CONFIG.get("results") or {}
 MODELS = CONFIG.get("models") or {}
+
+# Absent block == no rate limiting, which is why this is a plain `or {}` rather
+# than a default of 20/hour: an environment that says nothing about rate limiting
+# gets none, and turning it off is deleting the block rather than finding the
+# magic number that means "unlimited".
+RATE_LIMIT = CONFIG.get("rate_limit") or {}
+
+
+def rate_limit_settings():
+    """(requests, window_seconds) for the limiter, or None when it is switched off."""
+    if not RATE_LIMIT:
+        return None
+    requests = RATE_LIMIT.get("requests")
+    if requests is None:
+        return None
+    return int(requests), int(RATE_LIMIT.get("window_seconds", 3600))
 
 
 def model_path(kind):
@@ -90,6 +106,22 @@ def validate():
         problems.append(f"results.backend {backend!r} is not 'local' or 's3'")
     if backend == "s3" and not RESULTS.get("bucket"):
         problems.append("results.backend is 's3' but results.bucket is missing")
+    if RATE_LIMIT:
+        try:
+            requests, window = rate_limit_settings() or (None, None)
+            if requests is not None:
+                if requests < 1:
+                    problems.append(
+                        f"rate_limit.requests {requests} is not at least 1 "
+                        "(delete the rate_limit block to switch limiting off)")
+                if window < 1:
+                    problems.append(
+                        f"rate_limit.window_seconds {window} is not at least 1")
+        except (TypeError, ValueError):
+            problems.append(
+                "rate_limit.requests and rate_limit.window_seconds must be whole "
+                f"numbers, got {RATE_LIMIT.get('requests')!r} and "
+                f"{RATE_LIMIT.get('window_seconds')!r}")
     if problems:
         raise ConfigError(
             f"config/{APP_ENV}.yaml is not usable:\n  - " + "\n  - ".join(problems)

@@ -45,6 +45,27 @@ rather than as "not an image".
 `GET /health` → `{"ok": true, "models": "...", "ready": true}`. `ready` is false when
 a model file is missing or corrupt.
 
+## Rate limiting
+`/predict` allows **20 requests per client per rolling hour**; the 21st gets a **429**
+carrying a `Retry-After` header and a `retry_after` in its detail. `/health` is never
+limited, so the platform's probe keeps working while a caller is being told to wait.
+The limit lives in `rate_limit` in `config/<APP_ENV>.yaml` — delete the block to
+switch limiting off.
+
+The window is a true rolling one: each request is remembered by timestamp and
+forgotten an hour later, so nobody gets 40 requests by straddling a bucket boundary,
+and a client who keeps hammering after a 429 doesn't push their own reset further
+away. `rate_limit.py` imports no web framework and takes an injectable clock, both so
+that abi-server can reuse it and so its behaviour is testable without waiting an hour.
+
+Two limits on what this can promise. Callers are identified by the client-most entry
+of **X-Forwarded-For** — App Runner terminates the connection, so the socket peer is
+the load balancer and keying on it would ration the whole service to 20 requests an
+hour — and that header is caller-supplied, so this curbs casual hammering rather than
+deliberate evasion. And the counters are **in memory, per process**: a deploy clears
+them, and if App Runner scales out the real ceiling is 20 × instances. Making it exact
+would take shared storage and an identity the client can't choose.
+
 ## Errors
 Failures are separated into the caller's and ours, so the UI can say something better
 than "something went wrong":
@@ -55,6 +76,7 @@ than "something went wrong":
 | **413** | the upload is over 20 MB, or decodes to an absurd number of pixels | caller can fix it |
 | **422** | **it isn't a cookie** — the classifier is a gate, so there is no count | caller can fix it |
 | **422** | no `file` field at all (FastAPI's own validation) | caller can fix it |
+| **429** | too many requests from this client lately — carries `Retry-After` | caller can fix it |
 | **503** | the models aren't loaded — the service is up but can't predict | deployment |
 | **500** | anything else | our bug |
 

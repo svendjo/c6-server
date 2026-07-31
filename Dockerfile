@@ -8,13 +8,13 @@ COPY requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files. Every module server.py imports must be listed: predictor
-# (the models and the image handling), config (the env YAML) and results_store
-# (where predictions are saved). A missing one only fails at container start, so
-# keep this in sync.
+# (the models and the image handling), config (the env YAML), rate_limit (the
+# /predict limiter) and results_store (where predictions are saved). A missing one
+# only fails at container start, so keep this in sync.
 #
 # Nothing needs apt-get for HEIC support: the pillow-heif wheel vendors its own
 # libheif, libde265 and libx265, so pip install is the whole story.
-COPY server.py predictor.py config.py results_store.py .
+COPY server.py predictor.py rate_limit.py config.py results_store.py .
 # The two models named in config/aws-prod.yaml's `models:` block. Listed explicitly
 # rather than `COPY *.tflite`: c6-models drops every model it trains into this
 # directory, and a glob would bake all of them -- including the superseded .h5 and

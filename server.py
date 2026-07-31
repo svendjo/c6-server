@@ -29,8 +29,14 @@ something better than "something went wrong":
     400  not an image format we can read (also empty or truncated)
     413  the upload is over 20 MB, or decodes to an absurd number of pixels
     422  it isn't a cookie -- the classifier is the gate, so there is no count
+    429  too many requests from this caller lately (see rate_limit.py)
     503  the models aren't loaded -- the service is up but can't predict
     500  anything else, i.e. our bug
+
+/predict is rate limited per client IP over a rolling window, configured by the
+`rate_limit` block in config/<APP_ENV>.yaml. The 429 additionally carries
+`retry_after` seconds in its detail and a Retry-After header. /health is not
+limited, so the platform's probe still works while a caller is being told to wait.
 
 The 4xx/503 bodies are `{"detail": {"message": ..., "hint": ..., "id": ...}}`:
 `message` is safe to show the user, `hint` tells them what to do about it. (FastAPI
@@ -40,7 +46,7 @@ as the generic case.) A 500 says only that something broke on our side and gives
 the prediction `id` to quote -- the exception itself goes to the log and to
 error.txt in the saved folder, not to the client.
 """
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import Depends, FastAPI, File, Request, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -54,6 +60,7 @@ from PIL import Image, UnidentifiedImageError
 
 import config
 import predictor
+import rate_limit
 import results_store
 
 # Which formats count as a readable image lives in predictor.ACCEPTED_FORMATS, next
@@ -105,6 +112,8 @@ async def lifespan(app):
               f"{'' if loaded else '  [NOT LOADABLE -- /predict will 503]'}")
     print(f"Confidence threshold: {config.CONFIDENCE_THRESHOLD}")
     print(f"Results store: {config.RESULTS.get('backend', 'local')}")
+    limit = limiter()
+    print(f"Rate limit: {limit.describe() if limit else 'none'}")
     yield
 
 
@@ -118,6 +127,60 @@ app.add_middleware(
     allow_methods=["GET", "POST"],  # GET for /health, POST for /predict
     allow_headers=["*"],
 )
+
+
+@lru_cache(maxsize=1)
+def limiter():
+    """The /predict rate limiter, or None when the config asks for no limiting.
+
+    Built once and cached, because its counters ARE its state -- rebuilding it per
+    request would reset the window every time and enforce nothing.
+    """
+    settings = config.rate_limit_settings()
+    if settings is None:
+        return None
+    requests, window = settings
+    return rate_limit.RateLimiter(requests, window)
+
+
+async def rate_limited(request: Request):
+    """FastAPI dependency: allow the request through, or answer 429.
+
+    Attached per route rather than as middleware so that only the expensive
+    endpoint pays -- /health has to stay answerable for the platform's probe even
+    while a caller is being limited.
+    """
+    limit = limiter()
+    if limit is None:
+        return
+    key = rate_limit.client_ip(
+        request.headers.get("x-forwarded-for"),
+        request.client.host if request.client else "unknown")
+    try:
+        limit.check(key)
+    except rate_limit.RateLimited as e:
+        # 429 rather than 403: the request is fine, there have just been too many of
+        # them, and it will succeed again later. Retry-After says exactly when, so a
+        # client can wait instead of hammering -- the header is the machine-readable
+        # half of the same thing the hint says in words.
+        print(f"Rate limited {key}: {e}")
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "You've counted a lot of cookies recently.",
+                "hint": f"Wait {_retry_phrase(e.retry_after)} and try again.",
+                "retry_after": e.retry_after,
+            },
+            headers={"Retry-After": str(e.retry_after)},
+        )
+
+
+def _retry_phrase(seconds):
+    """`retry_after` as something worth reading in a dialog."""
+    if seconds < 60:
+        return f"{seconds} seconds"
+    minutes = round(seconds / 60)
+    return "a minute" if minutes <= 1 else f"about {minutes} minutes"
 
 
 @lru_cache(maxsize=1)
@@ -230,7 +293,7 @@ async def health():
     return {"ok": True, "models": predictor.describe(), "ready": predictor.ready()}
 
 
-@app.post("/predict")
+@app.post("/predict", dependencies=[Depends(rate_limited)])
 async def predict(file: UploadFile = File(...)):
     if not predictor.ready():
         # 503, not 500: the service is up, it just can't predict -- and no amount of
