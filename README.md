@@ -1,5 +1,5 @@
 # c6-server
-Web service for Count Chocolate II.
+Web service for Count Chocolate II (the site is **https://countchocolate.com**).
 
 Takes an uploaded photo of a cookie, runs two TFLite models from `c6-models`, and
 returns how many chocolate chips it sees — plus whether the photo is a cookie at
